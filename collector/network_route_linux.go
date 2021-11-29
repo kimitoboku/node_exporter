@@ -23,7 +23,7 @@ import (
 	"strconv"
 
 	"github.com/go-kit/log"
-	"github.com/jsimonetti/rtnetlink"
+	"github.com/vishvananda/netlink"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -43,7 +43,7 @@ func NewNetworkRouteCollector(logger log.Logger) (Collector, error) {
 
 	routeInfoDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, subsystem, "route_info"),
-		"network routing table information", []string{"device", "src", "dest", "gw", "priority", "proto", "weight"}, nil,
+		"network routing table information", []string{"device", "src", "dest", "gw", "priority", "proto", "weight", "family", "table"}, nil,
 	)
 	routesDesc := prometheus.NewDesc(
 		prometheus.BuildFQName(namespace, subsystem, "routes"),
@@ -60,71 +60,72 @@ func NewNetworkRouteCollector(logger log.Logger) (Collector, error) {
 func (n networkRouteCollector) Update(ch chan<- prometheus.Metric) error {
 	deviceRoutes := make(map[string]int)
 
-	conn, err := rtnetlink.Dial(nil)
-	if err != nil {
-		return fmt.Errorf("couldn't connect rtnetlink: %w", err)
-	}
-	defer conn.Close()
-
-	links, err := conn.Link.List()
+	links, err := netlink.LinkList()
 	if err != nil {
 		return fmt.Errorf("couldn't get links: %w", err)
 	}
 
-	routes, err := conn.Route.List()
+	routingTableMaps := networkRouteGenerateRoutingTableMap(links)
+
+	routesByFamily, err := networkRouteGet()
 	if err != nil {
 		return fmt.Errorf("couldn't get routes: %w", err)
 	}
 
-	for _, route := range routes {
-		if route.Type != unix.RTA_DST {
-			continue
-		}
-		if len(route.Attributes.Multipath) != 0 {
-			for _, nextHop := range route.Attributes.Multipath {
+	for family, routes := range routesByFamily {
+		for _, route := range routes {
+			if route.Type != unix.RTA_DST {
+				continue
+			}
+			if len(route.MultiPath) != 0 {
+				for _, nextHop := range route.MultiPath {
+					ifName := ""
+					for _, link := range links {
+						if link.Attrs().Index == nextHop.LinkIndex {
+							ifName = link.Attrs().Name
+							break
+						}
+					}
+
+					labels := []string{
+						ifName,                                              // if
+						networkRouteIPToString(route.Src),                   // src
+						networkRouteDestPrefix(route.Dst),                   // dest
+						networkRouteIPToString(nextHop.Gw),                  // gw
+						strconv.FormatUint(uint64(route.Priority), 10),      // priority(metrics)
+						networkRouteProtocolToString(uint8(route.Protocol)), // proto
+						strconv.Itoa(int(nextHop.Hops) + 1),                 // weight
+						family,                                              // Family
+						routingTableMaps[route.Table],                       // Table
+					}
+					ch <- prometheus.MustNewConstMetric(n.routeInfoDesc, prometheus.GaugeValue, 1, labels...)
+					deviceRoutes[ifName]++
+				}
+			} else {
 				ifName := ""
 				for _, link := range links {
-					if link.Index == nextHop.Hop.IfIndex {
-						ifName = link.Attributes.Name
+					if link.Attrs().Index == route.LinkIndex {
+						ifName = link.Attrs().Name
 						break
 					}
 				}
 
 				labels := []string{
-					ifName, // if
-					networkRouteIPToString(route.Attributes.Src),                            // src
-					networkRouteIPWithPrefixToString(route.Attributes.Dst, route.DstLength), // dest
-					networkRouteIPToString(nextHop.Gateway),                                 // gw
-					strconv.FormatUint(uint64(route.Attributes.Priority), 10),               // priority(metrics)
-					networkRouteProtocolToString(route.Protocol),                            // proto
-					strconv.Itoa(int(nextHop.Hop.Hops) + 1),                                 // weight
+					ifName,                                              // if
+					networkRouteIPToString(route.Src),                   // src
+					networkRouteDestPrefix(route.Dst),                   // dest
+					networkRouteIPToString(route.Gw),                    // gw
+					strconv.FormatUint(uint64(route.Priority), 10),      // priority(metrics)
+					networkRouteProtocolToString(uint8(route.Protocol)), // proto
+					"",                            // weight
+					family,                        // Family
+					routingTableMaps[route.Table], // Table
 				}
 				ch <- prometheus.MustNewConstMetric(n.routeInfoDesc, prometheus.GaugeValue, 1, labels...)
 				deviceRoutes[ifName]++
 			}
-		} else {
-			ifName := ""
-			for _, link := range links {
-				if link.Index == route.Attributes.OutIface {
-					ifName = link.Attributes.Name
-					break
-				}
-			}
-
-			labels := []string{
-				ifName, // if
-				networkRouteIPToString(route.Attributes.Src),                            // src
-				networkRouteIPWithPrefixToString(route.Attributes.Dst, route.DstLength), // dest
-				networkRouteIPToString(route.Attributes.Gateway),                        // gw
-				strconv.FormatUint(uint64(route.Attributes.Priority), 10),               // priority(metrics)
-				networkRouteProtocolToString(route.Protocol),                            // proto
-				"", // weight
-			}
-			ch <- prometheus.MustNewConstMetric(n.routeInfoDesc, prometheus.GaugeValue, 1, labels...)
-			deviceRoutes[ifName]++
 		}
 	}
-
 	for dev, total := range deviceRoutes {
 		ch <- prometheus.MustNewConstMetric(n.routesDesc, prometheus.GaugeValue, float64(total), dev)
 	}
@@ -132,19 +133,27 @@ func (n networkRouteCollector) Update(ch chan<- prometheus.Metric) error {
 	return nil
 }
 
-func networkRouteIPWithPrefixToString(ip net.IP, len uint8) string {
-	if len == 0 {
-		return "default"
+func networkRouteGet() (map[string][]netlink.Route, error) {
+	routeFilter := &netlink.Route{
+		Table: 0,
 	}
-	iplen := net.IPv4len
-	if ip.To4() == nil {
-		iplen = net.IPv6len
+
+	v4Routes, err := netlink.RouteListFiltered(netlink.FAMILY_V4, routeFilter, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return nil, err
 	}
-	network := &net.IPNet{
-		IP:   ip,
-		Mask: net.CIDRMask(int(len), iplen*8),
+
+	v6Routes, err := netlink.RouteListFiltered(netlink.FAMILY_V6, routeFilter, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		return nil, err
 	}
-	return network.String()
+
+	routes := map[string][]netlink.Route{
+		"IPv4": v4Routes,
+		"IPv6": v6Routes,
+	}
+
+	return routes, nil
 }
 
 func networkRouteIPToString(ip net.IP) string {
@@ -201,4 +210,29 @@ func networkRouteProtocolToString(protocol uint8) string {
 		return "eigrp"
 	}
 	return "unknown"
+}
+
+func networkRouteDestPrefix(dst *net.IPNet) string {
+	if dst == nil {
+		return "default"
+	}
+	return fmt.Sprintf("%s", dst)
+}
+
+func networkRouteGenerateRoutingTableMap(links []netlink.Link) map[int]string {
+	rtm := map[int]string{
+		253: "default",
+		254: "main",
+		255: "local",
+	}
+
+	for _, link := range links {
+		linkType := link.Type()
+		if linkType == "vrf" {
+			vrf := link.(*netlink.Vrf)
+			rtm[int(vrf.Table)] = vrf.Name
+		}
+	}
+
+	return rtm
 }

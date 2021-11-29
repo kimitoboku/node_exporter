@@ -9,7 +9,7 @@ require (
 	github.com/hashicorp/go-envparse v0.0.0-20200406174449-d9cfd743a15e
 	github.com/hodgesds/perf-utils v0.4.0
 	github.com/illumos/go-kstat v0.0.0-20210513183136-173c9b0a9973
-	github.com/jsimonetti/rtnetlink v0.0.0-20211022192332-93da33804786
+	github.com/jsimonetti/rtnetlink v0.0.0-20211022192332-93da33804786 // indirect
 	github.com/lufia/iostat v1.2.0
 	github.com/mattn/go-xmlrpc v0.0.3
 	github.com/mdlayher/wifi v0.0.0-20200527114002-84f0b9457fdd
@@ -21,6 +21,7 @@ require (
 	github.com/safchain/ethtool v0.1.0
 	github.com/siebenmann/go-kstat v0.0.0-20210513183136-173c9b0a9973 // indirect
 	github.com/soundcloud/go-runit v0.0.0-20150630195641-06ad41a06c4a
+	github.com/vishvananda/netlink v1.1.0
 	golang.org/x/sys v0.0.0-20211117180635-dee7805ff2e1
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
 )
